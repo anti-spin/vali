@@ -72,3 +72,8 @@ Optional JSON array mounted inside the container:
 ]
 
 ```
+
+
+## License
+
+[MIT](LICENSE) anti-spin
