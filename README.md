@@ -14,7 +14,7 @@ docker run -d \
   -e REDIS_URL="redis:6379" \
   -e VALI_DOMAINS="example.com,*.example.net" \
   --name vali \
-  ghcr.io/your-user/vali:latest
+  ghcr.io/anti-spin/vali:latest
 ```
 
 ## Endpoints
