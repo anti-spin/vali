@@ -1,0 +1,14 @@
+{
+    on_demand_tls {
+        ask http://vali:8080/vali/
+    }
+}
+
+https:// {
+    tls {
+        on_demand
+    }
+
+    # Reverse proxy to backend app...
+    reverse_proxy app:3000
+}

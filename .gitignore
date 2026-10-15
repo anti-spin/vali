@@ -1,0 +1,5 @@
+vali
+*.so
+*.dylib
+*.dll
+.env
