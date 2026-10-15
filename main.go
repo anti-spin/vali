@@ -18,6 +18,7 @@ import (
 var (
 	rdb           *redis.Client
 	mariaDB       *sql.DB
+	useRedis      bool
 	useMariaDB    bool
 	staticDomains []string
 )
@@ -40,25 +41,30 @@ func main() {
 		}
 	}
 
-	// Redis setup
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		redisURL = "localhost:6379"
-	}
+	// Redis setup (enabled by default unless explicitly disabled)
+	useRedis = os.Getenv("VALI_USE_REDIS") != "false"
+	if useRedis {
+		redisURL := os.Getenv("REDIS_URL")
+		if redisURL == "" {
+			redisURL = "localhost:6379"
+		}
 
-	opt, err := redis.ParseURL(redisURL)
-	if err != nil {
-		// Fallback to plain address if not a connection URL
-		opt = &redis.Options{Addr: redisURL}
-	}
+		opt, err := redis.ParseURL(redisURL)
+		if err != nil {
+			opt = &redis.Options{Addr: redisURL}
+		}
 
-	rdb = redis.NewClient(opt)
+		rdb = redis.NewClient(opt)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
 
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		log.Fatalf("Could not connect to Redis: %v", err)
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			log.Fatalf("Could not connect to Redis: %v", err)
+		}
+		log.Println("Connected to Redis")
+	} else {
+		log.Println("Redis integration disabled (VALI_USE_REDIS=false)")
 	}
 
 	// MariaDB / MySQL setup
@@ -74,6 +80,7 @@ func main() {
 		mariaDBName := os.Getenv("DB_DATABASE")
 
 		dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", mariaDBUser, mariaDBPass, mariaDBHost, mariaDBPort, mariaDBName)
+		var err error
 		mariaDB, err = sql.Open("mysql", dsn)
 		if err != nil {
 			log.Fatalf("Could not configure MariaDB pool: %v", err)
@@ -82,7 +89,10 @@ func main() {
 		mariaDB.SetMaxIdleConns(5)
 		mariaDB.SetConnMaxLifetime(5 * time.Minute)
 
-		if err = mariaDB.PingContext(ctx); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		if err := mariaDB.PingContext(ctx); err != nil {
 			log.Fatalf("Could not connect to MariaDB: %v", err)
 		}
 		log.Println("Connected to MariaDB")
@@ -136,21 +146,23 @@ func validateDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 2. Redis Lookup
-	exists, err := rdb.Exists(ctx, domain).Result()
-	if err != nil {
-		log.Printf("Error checking domain in Redis: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-	if exists == 1 {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Domain is valid"))
-		return
+	// 2. Redis Lookup (if enabled)
+	if useRedis && rdb != nil {
+		exists, err := rdb.Exists(ctx, domain).Result()
+		if err != nil {
+			log.Printf("Error checking domain in Redis: %v", err)
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+		if exists == 1 {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("Domain is valid"))
+			return
+		}
 	}
 
-	// 3. MariaDB Lookup
-	if useMariaDB {
+	// 3. MariaDB Lookup (if enabled)
+	if useMariaDB && mariaDB != nil {
 		query := "SELECT EXISTS (SELECT 1 FROM domains WHERE domain_name = ?)"
 		var dbExists bool
 		err := mariaDB.QueryRowContext(ctx, query, domain).Scan(&dbExists)
@@ -173,12 +185,14 @@ func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
 
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		http.Error(w, "Redis unhealthy", http.StatusServiceUnavailable)
-		return
+	if useRedis && rdb != nil {
+		if err := rdb.Ping(ctx).Err(); err != nil {
+			http.Error(w, "Redis unhealthy", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
-	if useMariaDB {
+	if useMariaDB && mariaDB != nil {
 		if err := mariaDB.PingContext(ctx); err != nil {
 			http.Error(w, "MariaDB unhealthy", http.StatusServiceUnavailable)
 			return
