@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/redis/go-redis/v9"
@@ -34,7 +35,7 @@ func main() {
 	// Load additional static domains directly from env (comma-separated: "example.com,*.example.net")
 	if envDomains := os.Getenv("VALI_DOMAINS"); envDomains != "" {
 		for _, d := range strings.Split(envDomains, ",") {
-			d = strings.TrimSpace(d)
+			d = strings.ToLower(strings.TrimSpace(d))
 			if d != "" {
 				staticDomains = append(staticDomains, d)
 			}
@@ -119,34 +120,86 @@ func loadStaticDomains(configFile string) {
 		return
 	}
 
-	if err := json.Unmarshal(data, &staticDomains); err != nil {
+	var rawDomains []string
+	if err := json.Unmarshal(data, &rawDomains); err != nil {
 		log.Printf("Warning: Could not parse static domains file: %v", err)
+		return
 	}
+
+	for _, d := range rawDomains {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d != "" {
+			staticDomains = append(staticDomains, d)
+		}
+	}
+}
+
+// isValidDomainInput validates domain syntax per RFC 1035 / RFC 1123 constraints.
+func isValidDomainInput(d string) bool {
+	// Overall length constraints (1 to 253 chars)
+	if len(d) == 0 || len(d) > 253 || strings.HasPrefix(d, ".") || strings.HasSuffix(d, "..") {
+		return false
+	}
+
+	// Character whitelist: A-Z, a-z, 0-9, '-', '.'
+	for _, r := range d {
+		if !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '.') {
+			return false
+		}
+	}
+
+	// Label checks (split by dot)
+	labels := strings.Split(d, ".")
+	if len(labels) < 2 { // Require at least second-level domain + TLD (e.g., example.com)
+		return false
+	}
+
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return false
+		}
+	}
+
+	return true
 }
 
 func validateDomain(w http.ResponseWriter, r *http.Request) {
 	domain := r.URL.Query().Get("domain")
 	if domain == "" {
-		domain = strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/vali/"))
-		if domain == "" {
-			http.Error(w, "Domain parameter or path required", http.StatusBadRequest)
-			return
+		domain = strings.TrimPrefix(r.URL.Path, "/vali/")
+	}
+
+	// 1. Normalize early
+	domain = strings.ToLower(strings.TrimSpace(domain))
+
+	// Remove optional trailing root dot (e.g. "example.com.")
+	domain = strings.TrimSuffix(domain, ".")
+
+	// 2. Strict Input Hardening
+	if !isValidDomainInput(domain) {
+		// Clean control characters before logging to prevent log injection
+		cleanLog := strings.ReplaceAll(strings.ReplaceAll(domain, "\n", ""), "\r", "")
+		if len(cleanLog) > 64 {
+			cleanLog = cleanLog[:64] + "..."
 		}
+		log.Printf("Blocked invalid domain request: %q", cleanLog)
+
+		http.Error(w, "Invalid domain format", http.StatusBadRequest)
+		return
 	}
 
 	ctx := r.Context()
 
-	// 1. Static Domain Match
+	// 3. Static Domain Check (Exact & Wildcard)
 	for _, staticDomain := range staticDomains {
-		if strings.EqualFold(domain, staticDomain) ||
-			(strings.HasPrefix(staticDomain, "*") && strings.HasSuffix(domain, strings.TrimPrefix(staticDomain, "*"))) {
+		if domain == staticDomain || (strings.HasPrefix(staticDomain, "*.") && strings.HasSuffix(domain, staticDomain[1:])) {
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte("Domain is valid"))
 			return
 		}
 	}
 
-	// 2. Redis Lookup (if enabled)
+	// 4. Redis Lookup
 	if useRedis && rdb != nil {
 		exists, err := rdb.Exists(ctx, domain).Result()
 		if err != nil {
@@ -161,7 +214,7 @@ func validateDomain(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 3. MariaDB Lookup (if enabled)
+	// 5. MariaDB Lookup
 	if useMariaDB && mariaDB != nil {
 		query := "SELECT EXISTS (SELECT 1 FROM domains WHERE domain_name = ?)"
 		var dbExists bool
