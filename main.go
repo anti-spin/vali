@@ -24,6 +24,13 @@ var (
 	staticDomains []string
 )
 
+func setupRouter() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthCheckHandler)
+	mux.HandleFunc("/vali/", validateDomain)
+	return mux
+}
+
 func main() {
 	// Load static domains from JSON file if provided
 	configFile := os.Getenv("VALI_DOMAINS_FILE")
@@ -99,8 +106,7 @@ func main() {
 		log.Println("Connected to MariaDB")
 	}
 
-	http.HandleFunc("/healthz", healthCheckHandler)
-	http.HandleFunc("/vali/", validateDomain)
+	mux := setupRouter()
 
 	port := os.Getenv("VALI_PORT")
 	if port == "" {
@@ -108,7 +114,7 @@ func main() {
 	}
 
 	log.Printf("Starting vali service on :%s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
